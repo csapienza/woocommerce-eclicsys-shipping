@@ -13,7 +13,7 @@ class WC_Eclicsys_Order_Handler {
         // Store API (block checkout) - correct hook name
         add_action('woocommerce_store_api_checkout_order_processed', [$this, 'handle_store_api_order'], 10, 1);
 
-        // Alternative: hook on order creation (works for both classic and block)
+        // Alternative: hook on order creation
         add_action('woocommerce_checkout_order_created', [$this, 'handle_checkout_order_created'], 10, 1);
 
         // Fallback: new order hook (fires for all order creation methods)
@@ -23,6 +23,9 @@ class WC_Eclicsys_Order_Handler {
         if (defined('WP_DEBUG') && WP_DEBUG) {
             add_action('woocommerce_order_status_changed', [$this, 'debug_status_change'], 10, 4);
         }
+
+        // Debug AJAX: preview payload without sending
+        add_action('wp_ajax_eclicsys_debug_payload', [$this, 'ajax_debug_payload']);
     }
 
     /**
@@ -49,10 +52,42 @@ class WC_Eclicsys_Order_Handler {
     }
 
     /**
+     * AJAX: Debug payload without sending to API
+     */
+    public function ajax_debug_payload(): void {
+        check_ajax_referer('eclicsys-admin', 'nonce');
+
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(__('Unauthorized', 'wc-eclicsys-shipping'));
+        }
+
+        $order_id = absint($_POST['order_id'] ?? 0);
+        $order = wc_get_order($order_id);
+
+        if (!$order) {
+            wp_send_json_error(__('Order not found', 'wc-eclicsys-shipping'));
+        }
+
+        $service_code = $this->get_service_code($order);
+
+        $builder = new WC_Eclicsys_Order_Builder();
+        $payload = $builder->build($order, $service_code ?? 'standard');
+
+        wp_send_json_success([
+            'payload' => $payload,
+            'service_code' => $service_code,
+            'shipping_methods' => array_map(function($m) {
+                return [
+                    'id' => $m->get_method_id(),
+                    'instance_id' => $m->get_instance_id(),
+                    'meta' => $m->get_meta_data(),
+                ];
+            }, $order->get_shipping_methods()),
+        ]);
+    }
+
+    /**
      * Handle Store API checkout (block-based checkout)
-     * Fires when order is processed through the REST API / Store API
-     * 
-     * @param WC_Order $order The order object.
      */
     public function handle_store_api_order(WC_Order $order): void {
         if (defined('WP_DEBUG') && WP_DEBUG) {
@@ -64,15 +99,12 @@ class WC_Eclicsys_Order_Handler {
 
     /**
      * Handle classic checkout order creation
-     * 
-     * @param WC_Order $order The order object.
      */
     public function handle_checkout_order_created(WC_Order $order): void {
         if (defined('WP_DEBUG') && WP_DEBUG) {
             error_log('[Eclicsys] Checkout order created: ' . $order->get_id() . ' | Status: ' . $order->get_status());
         }
 
-        // For classic checkout, process immediately if status is already processing/completed
         if ($order->get_status() === 'processing' || $order->get_status() === 'completed') {
             $this->process_order($order);
         }
@@ -80,17 +112,12 @@ class WC_Eclicsys_Order_Handler {
 
     /**
      * Handle new order (fires for all order creation methods)
-     * 
-     * @param int      $order_id Order ID.
-     * @param WC_Order $order    Order object.
      */
     public function handle_new_order(int $order_id, WC_Order $order): void {
         if (defined('WP_DEBUG') && WP_DEBUG) {
             error_log('[Eclicsys] New order: ' . $order_id . ' | Status: ' . $order->get_status());
         }
 
-        // Only process if status is already processing or completed
-        // (for orders created via admin or other methods that skip pending)
         if ($order->get_status() === 'processing' || $order->get_status() === 'completed') {
             $this->process_order($order);
         }
@@ -98,9 +125,6 @@ class WC_Eclicsys_Order_Handler {
 
     /**
      * Main entry point for processing an order via status hooks
-     * 
-     * @param int      $order_id Order ID.
-     * @param WC_Order $order    Order object.
      */
     public function maybe_create_shipment(int $order_id, WC_Order $order): void {
         if (defined('WP_DEBUG') && WP_DEBUG) {
@@ -112,14 +136,10 @@ class WC_Eclicsys_Order_Handler {
 
     /**
      * Process order: create shipment in Eclicsys
-     * Central method that handles all entry points.
-     * 
-     * @param WC_Order $order The order to process.
      */
     private function process_order(WC_Order $order): void {
         $order_id = $order->get_id();
 
-        // Prevent duplicate processing
         if ($order->get_meta('_eclicsys_tracking_code')) {
             if (defined('WP_DEBUG') && WP_DEBUG) {
                 error_log('[Eclicsys] Order ' . $order_id . ' already has tracking, skipping');
@@ -127,7 +147,6 @@ class WC_Eclicsys_Order_Handler {
             return;
         }
 
-        // Prevent race conditions
         if ($order->get_meta('_eclicsys_syncing')) {
             if (defined('WP_DEBUG') && WP_DEBUG) {
                 error_log('[Eclicsys] Order ' . $order_id . ' is already syncing, skipping');
@@ -175,7 +194,6 @@ class WC_Eclicsys_Order_Handler {
                 error_log('[Eclicsys] Order ' . $order_id . ' - API response: ' . json_encode($response));
             }
 
-            // Extract tracking using the helper methods
             $tracking_code = WC_Eclicsys_API_Client::extract_tracking($response);
             $eclicsys_order_id = WC_Eclicsys_API_Client::extract_order_id($response);
             $status = WC_Eclicsys_API_Client::extract_status($response);
@@ -188,7 +206,6 @@ class WC_Eclicsys_Order_Handler {
             $order->update_meta_data('_eclicsys_order_id', $eclicsys_order_id);
             $order->update_meta_data('_eclicsys_status', $status);
             $order->add_order_note(sprintf(
-                /* translators: %1$s: tracking code, %2$s: status */
                 __('Eclicsys shipment created. Tracking: %1$s | Status: %2$s', 'wc-eclicsys-shipping'),
                 $tracking_code,
                 $status
@@ -201,7 +218,6 @@ class WC_Eclicsys_Order_Handler {
         } catch (Exception $e) {
             $error_msg = $e->getMessage();
             $order->add_order_note(sprintf(
-                /* translators: %s: error message */
                 __('Eclicsys error: %s', 'wc-eclicsys-shipping'),
                 $error_msg
             ));
@@ -216,9 +232,6 @@ class WC_Eclicsys_Order_Handler {
 
     /**
      * Extract service code from shipping method used in order
-     * 
-     * @param WC_Order $order The order to check.
-     * @return string|null Service code or null if not Eclicsys.
      */
     private function get_service_code(WC_Order $order): ?string {
         foreach ($order->get_shipping_methods() as $shipping) {
@@ -232,7 +245,6 @@ class WC_Eclicsys_Order_Handler {
                 continue;
             }
 
-            // Try to get service_code from meta_data
             $meta_data = $shipping->get_meta_data();
             foreach ($meta_data as $meta) {
                 if ($meta->key === 'service_code') {
@@ -240,13 +252,11 @@ class WC_Eclicsys_Order_Handler {
                 }
             }
 
-            // Try legacy meta
             $service_code = $shipping->get_meta('service_code');
             if ($service_code) {
                 return $service_code;
             }
 
-            // Fallback: infer from rate ID
             $rate_id = $shipping->get_instance_id() 
                 ? $method_id . ':' . $shipping->get_instance_id() 
                 : $method_id;

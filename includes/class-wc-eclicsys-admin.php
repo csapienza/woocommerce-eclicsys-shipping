@@ -9,10 +9,10 @@ class WC_Eclicsys_Admin {
         add_action('add_meta_boxes', [$this, 'add_tracking_metabox']);
         add_filter('manage_edit-shop_order_columns', [$this, 'add_tracking_column'], 20);
         add_action('manage_shop_order_posts_custom_column', [$this, 'render_tracking_column'], 20, 2);
-        
+
         add_action('wp_ajax_eclicsys_force_create_order', [$this, 'ajax_force_create']);
         add_action('wp_ajax_eclicsys_get_label', [$this, 'ajax_get_label']);
-        
+
         add_action('admin_enqueue_scripts', [$this, 'enqueue_assets']);
     }
 
@@ -26,7 +26,7 @@ class WC_Eclicsys_Admin {
                 WC_ECLICSYS_VERSION,
                 true
             );
-            
+
             wp_localize_script('eclicsys-admin', 'eclicsysAdmin', [
                 'ajaxUrl' => admin_url('admin-ajax.php'),
                 'nonce'   => wp_create_nonce('eclicsys-admin'),
@@ -39,10 +39,19 @@ class WC_Eclicsys_Admin {
     }
 
     public function add_tracking_metabox(): void {
-        $screen = class_exists('Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController')
-            && wc_get_container()->get(\Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController::class)->custom_orders_table_usage_is_enabled()
-            ? wc_get_page_screen_id('shop-order')
-            : 'shop_order';
+        // HPOS compatibility: detect which screen to use
+        $screen = 'shop_order';
+
+        if (class_exists('Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController')) {
+            try {
+                $controller = wc_get_container()->get(\Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController::class);
+                if ($controller->custom_orders_table_usage_is_enabled()) {
+                    $screen = wc_get_page_screen_id('shop-order');
+                }
+            } catch (Exception $e) {
+                // Fallback to classic screen
+            }
+        }
 
         add_meta_box(
             'eclicsys_tracking',
@@ -75,6 +84,17 @@ class WC_Eclicsys_Admin {
                 esc_attr($order->get_id()),
                 esc_html__('Create Shipment Now', 'wc-eclicsys-shipping')
             );
+
+            // Debug button (only in WP_DEBUG mode)
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                printf(
+                    '<button type="button" class="button eclicsys-debug-payload" data-order-id="%d" style="margin-top: 8px;">%s</button>',
+                    esc_attr($order->get_id()),
+                    esc_html__('Debug Payload', 'wc-eclicsys-shipping')
+                );
+                echo '<div id="eclicsys-debug-output" style="margin-top: 10px; display: none; background: #f0f0f0; padding: 10px; max-height: 300px; overflow: auto;"></div>';
+            }
+
             return;
         }
 
@@ -102,14 +122,14 @@ class WC_Eclicsys_Admin {
 
     public function add_tracking_column(array $columns): array {
         $new_columns = [];
-        
+
         foreach ($columns as $key => $value) {
             $new_columns[$key] = $value;
             if ($key === 'order_status') {
                 $new_columns['eclicsys_tracking'] = __('Eclicsys', 'wc-eclicsys-shipping');
             }
         }
-        
+
         return $new_columns;
     }
 

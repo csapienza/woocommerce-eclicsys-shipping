@@ -69,7 +69,7 @@ class WC_Eclicsys_API_Client {
     }
 
     /**
-     * Generic API request handler
+     * Generic API request handler with detailed logging
      */
     private function request(string $endpoint, array $data = [], string $method = 'POST'): array {
         $token = $this->get_token();
@@ -93,6 +93,9 @@ class WC_Eclicsys_API_Client {
             $response = wp_remote_post($url, $args);
         }
 
+        // Log request/response for debugging
+        $this->log_request($endpoint, $method, $data, $response);
+
         if (is_wp_error($response)) {
             throw new Exception('Request failed: ' . $response->get_error_message());
         }
@@ -102,10 +105,43 @@ class WC_Eclicsys_API_Client {
 
         if ($code >= 400) {
             $error = $body['message'] ?? 'HTTP ' . $code;
-            throw new Exception('API error: ' . $error);
+            throw new Exception('API error: HTTP ' . $code . ' - ' . $error . ' | Body: ' . json_encode($body));
         }
 
         return $body ?? [];
+    }
+
+    /**
+     * Log request and response details for debugging
+     */
+    private function log_request(string $endpoint, string $method, array $data, $response): void {
+        if (!defined('WP_DEBUG') || !WP_DEBUG) {
+            return;
+        }
+
+        $log_data = [
+            'timestamp' => date('Y-m-d H:i:s'),
+            'endpoint'  => $endpoint,
+            'method'    => $method,
+            'request'   => $data,
+        ];
+
+        if (is_wp_error($response)) {
+            $log_data['error'] = $response->get_error_message();
+        } else {
+            $log_data['response_code'] = wp_remote_retrieve_response_code($response);
+            $log_data['response_body'] = wp_remote_retrieve_body($response);
+        }
+
+        // Save to a dedicated log file
+        $log_file = WP_CONTENT_DIR . '/uploads/eclicsys-api-debug.log';
+        $log_entry = json_encode($log_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) . "\n---\n";
+
+        // Append to log file
+        file_put_contents($log_file, $log_entry, FILE_APPEND | LOCK_EX);
+
+        // Also log to WordPress debug log
+        error_log('[Eclicsys API] ' . $endpoint . ' ' . $method . ' | Code: ' . ($log_data['response_code'] ?? 'ERROR'));
     }
 
     public function get_shipping_rates(string $zip_code, array $items): array {
