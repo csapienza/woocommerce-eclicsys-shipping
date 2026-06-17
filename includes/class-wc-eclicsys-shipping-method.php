@@ -1,18 +1,10 @@
 <?php
 /**
  * Eclicsys Shipping Method
- * 
- * Uses WooCommerce instance settings for zone-based configuration.
- * Settings are saved automatically by WC_Settings_API::process_admin_options()
  */
 
 class WC_Eclicsys_Shipping_Method extends WC_Shipping_Method {
 
-    /**
-     * Constructor.
-     *
-     * @param int $instance_id Instance ID for zone-based methods.
-     */
     public function __construct($instance_id = 0) {
         $this->id = 'eclicsys_logistics';
         $this->instance_id = absint($instance_id);
@@ -27,28 +19,13 @@ class WC_Eclicsys_Shipping_Method extends WC_Shipping_Method {
         $this->init();
     }
 
-    /**
-     * Initialize the shipping method.
-     * Called by constructor. Sets up form fields and loads saved settings.
-     */
     public function init(): void {
-        // Load saved instance settings from database
         $this->init_instance_settings();
-
-        // Define form fields for the settings modal
         $this->init_form_fields();
-
-        // Set the title from saved option
         $this->title = $this->get_option('title', $this->method_title);
-
-        // Hook to save settings when admin updates them
         add_action('woocommerce_update_options_shipping_' . $this->id, array($this, 'process_admin_options'));
     }
 
-    /**
-     * Define instance form fields.
-     * These appear in the shipping zone modal when editing an instance.
-     */
     public function init_form_fields(): void {
         $this->instance_form_fields = array(
             'title' => array(
@@ -105,38 +82,70 @@ class WC_Eclicsys_Shipping_Method extends WC_Shipping_Method {
                 'type'        => 'checkbox',
                 'label'       => __('Enable debug logging', 'wc-eclicsys-shipping'),
                 'default'     => 'no',
-                'description' => __('Logs API requests to WooCommerce logs', 'wc-eclicsys-shipping'),
+                'description' => __('Logs API requests to WooCommerce logs (WooCommerce > Status > Logs)', 'wc-eclicsys-shipping'),
                 'desc_tip'    => true,
             ),
         );
     }
 
     /**
-     * Calculate shipping rates for a package.
-     *
-     * @param array $package Package of items from cart.
+     * Log message using WooCommerce logger
      */
+    private function log(string $message, array $context = []): void {
+        if ($this->get_option('debug') !== 'yes') {
+            return;
+        }
+
+        $log_message = '[Eclicsys Shipping] ' . $message;
+        if (!empty($context)) {
+            $log_message .= ' | ' . json_encode($context, JSON_UNESCAPED_UNICODE);
+        }
+
+        if (function_exists('wc_get_logger')) {
+            $logger = wc_get_logger();
+            $logger->debug($log_message, ['source' => 'eclicsys-shipping']);
+        } else {
+            error_log($log_message);
+        }
+    }
+
     public function calculate_shipping($package = array()): void {
-        // Check if method is enabled
+        $this->log('calculate_shipping started');
+
         if (!$this->is_enabled()) {
+            $this->log('Method disabled, returning');
             return;
         }
 
         $settings = WC_Eclicsys_Settings::get_instance();
 
         if (!$settings->is_configured()) {
+            $this->log('API not configured', [
+                'api_key' => $settings->get_api_key() ? 'set' : 'empty',
+                'api_secret' => $settings->get_api_secret() ? 'set' : 'empty',
+            ]);
             return;
         }
 
         $postcode = $package['destination']['postcode'] ?? '';
+        $this->log('Destination', ['postcode' => $postcode, 'country' => $package['destination']['country'] ?? 'N/A']);
 
         if (empty($postcode)) {
+            $this->log('No postcode, returning');
             return;
         }
 
-        // Free shipping check
-        $cart_total = WC()->cart ? WC()->cart->get_subtotal() : 0;
+        // CORRECTION: Safe cart total check - WC()->cart might not be available in all contexts
+        $cart_total = 0;
+        if (function_exists('WC') && WC()->cart) {
+            $cart_total = WC()->cart->get_subtotal();
+        } elseif (!empty($package['cart_subtotal'])) {
+            $cart_total = $package['cart_subtotal'];
+        }
+
         $free_min = $settings->get_free_shipping_min();
+
+        $this->log('Free shipping check', ['cart_total' => $cart_total, 'free_min' => $free_min]);
 
         if ($free_min > 0 && $cart_total >= $free_min) {
             $this->add_rate(array(
@@ -148,24 +157,40 @@ class WC_Eclicsys_Shipping_Method extends WC_Shipping_Method {
                     'service_name' => 'Free Shipping',
                 ),
             ));
+            $this->log('Added free shipping rate');
             return;
         }
 
         try {
             $items = $this->build_package_items($package);
+            $this->log('Items built', ['count' => count($items), 'items' => $items]);
+
             $client = new WC_Eclicsys_API_Client(
                 $settings->get_api_key(),
                 $settings->get_api_secret(),
                 $settings->get_api_url()
             );
 
+            $this->log('Requesting rates from API', ['url' => $settings->get_api_url(), 'postcode' => $postcode]);
             $response = $client->get_shipping_rates($postcode, $items);
+
+            $this->log('API response received', ['response' => $response]);
+
+            // CORRECTION: Handle both response structures
             $tariffs = $this->normalize_tariffs($response);
             $handling_fee = $settings->get_handling_fee();
 
+            $this->log('Tariffs normalized', ['count' => count($tariffs), 'handling_fee' => $handling_fee]);
+
+            if (empty($tariffs)) {
+                $this->log('No tariffs returned from API');
+                return;
+            }
+
             foreach ($tariffs as $tariff) {
                 $cost = $tariff['cost'] + $handling_fee;
-                if ($cost <= 0) {
+                if ($cost < 0) {
+                    $this->log('Skipping tariff with negative cost', ['tariff' => $tariff]);
                     continue;
                 }
 
@@ -178,20 +203,22 @@ class WC_Eclicsys_Shipping_Method extends WC_Shipping_Method {
                         'service_name' => $tariff['name'],
                     ),
                 ));
+
+                $this->log('Rate added', [
+                    'code' => $tariff['code'],
+                    'label' => $tariff['label'],
+                    'cost' => $cost,
+                    'base_cost' => $tariff['cost'],
+                    'handling_fee' => $handling_fee,
+                ]);
             }
+
         } catch (Exception $e) {
-            if (defined('WP_DEBUG') && WP_DEBUG) {
-                error_log('Eclicsys shipping error: ' . $e->getMessage());
-            }
+            $this->log('ERROR in calculate_shipping', ['error' => $e->getMessage()]);
+            // Optionally add a fallback rate or just let WooCommerce show "no shipping available"
         }
     }
 
-    /**
-     * Build items array from package for API request.
-     *
-     * @param array $package WooCommerce shipping package.
-     * @return array Items for Eclicsys API.
-     */
     private function build_package_items(array $package): array {
         $items = array();
 
@@ -217,12 +244,11 @@ class WC_Eclicsys_Shipping_Method extends WC_Shipping_Method {
     }
 
     /**
-     * Normalize tariffs from API response.
-     *
-     * @param array $response API response.
-     * @return array Normalized tariffs.
+     * Normalize tariffs from API response
+     * Handles both "rates" and "tariffs" keys
      */
     private function normalize_tariffs(array $response): array {
+        // CORRECTION: Check multiple possible response keys
         $raw = $response['rates'] ?? $response['tariffs'] ?? array();
 
         if (isset($response['cost']) && empty($raw)) {

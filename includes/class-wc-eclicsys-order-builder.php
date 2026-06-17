@@ -2,49 +2,10 @@
 /**
  * Builds order payload for Eclicsys API from WC_Order
  * 
- * Expected API structure (DNI is optional, not required):
- * {
- *   "contact": {
- *     "fullname": "...",
- *     "email": "...",
- *     "dni": "",
- *     "phone": "...",
- *     "mobile": "..."
- *   },
- *   "addresses": {
- *     "shipping": {
- *       "category_code": "shipping",
- *       "iso_code": "AR",
- *       "street": "...",
- *       "street_number": "...",
- *       "zip_code": "...",
- *       "city": "...",
- *       "locality": "",
- *       "province": "...",
- *       "contact": {
- *         "fullname": "...",
- *         "email": "...",
- *         "dni": "",
- *         "phone": "...",
- *         "mobile": "..."
- *       }
- *     },
- *     "billing": {
- *       "category_code": "billing",
- *       "iso_code": "AR",
- *       "street": "...",
- *       "street_number": "...",
- *       "zip_code": "...",
- *       "city": "...",
- *       "locality": "...",
- *       "province": "..."
- *     }
- *   },
- *   "products": [...],
- *   "shipping": {
- *     "service": "nextday"
- *   }
- * }
+ * Fields with empty values are OMITTED from the payload
+ * to prevent API validation errors.
+ * 
+ * EMAIL IS REQUIRED - will fallback to billing email, then admin email.
  */
 
 class WC_Eclicsys_Order_Builder {
@@ -65,23 +26,37 @@ class WC_Eclicsys_Order_Builder {
             $shipping_address = $billing_address;
         }
 
-        // Extract street number from address_1 (e.g., "Osvaldo Cruz 2683" -> "2683")
+        // Ensure shipping address has email (required by API)
+        // Fallback chain: shipping email -> billing email -> order billing email -> admin email
+        if (empty($shipping_address['email'])) {
+            $shipping_address['email'] = $billing_address['email'] 
+                ?? $order->get_billing_email() 
+                ?? get_option('admin_email');
+        }
+
+        // Ensure billing address has email
+        if (empty($billing_address['email'])) {
+            $billing_address['email'] = $order->get_billing_email() 
+                ?? get_option('admin_email');
+        }
+
+        // Extract street number from address_1
         $shipping_street_number = $this->extract_street_number($shipping_address['address_1'] ?? '');
         $billing_street_number  = $this->extract_street_number($billing_address['address_1'] ?? '');
 
-        // Build main contact (from billing)
-        $contact = $this->build_contact($billing_address);
+        // Build main contact (from billing) - email is REQUIRED
+        $contact = $this->build_contact($billing_address, true);
 
-        // Build shipping address with contact
+        // Build shipping address with minimal contact (fullname + email REQUIRED)
         $shipping = array_merge(
             $this->build_address($shipping_address, 'shipping', $shipping_street_number),
-            array('contact' => $this->build_contact($shipping_address))
+            array('contact' => $this->build_contact($shipping_address, false))
         );
 
         // Build billing address (no contact needed)
         $billing = $this->build_address($billing_address, 'billing', $billing_street_number);
 
-        return array(
+        $payload = array(
             'contact'   => $contact,
             'addresses' => array(
                 'shipping' => $shipping,
@@ -90,27 +65,71 @@ class WC_Eclicsys_Order_Builder {
             'products'  => $this->build_products($order),
             'shipping'  => array('service' => $service_code),
         );
+
+        // Add order reference if available
+        $order_reference = $order->get_order_number() ?: $order->get_id();
+        if ($order_reference) {
+            $payload['order_reference'] = (string) $order_reference;
+        }
+
+        return $payload;
     }
 
     /**
      * Build contact array from address data.
-     * DNI is optional and left empty.
+     * Omits empty fields to prevent API validation errors.
+     * EMAIL IS ALWAYS INCLUDED (required field).
      *
-     * @param array $address WooCommerce address array.
+     * @param array $address        WooCommerce address array.
+     * @param bool  $include_phone  Whether to include phone/mobile/dni fields.
      * @return array Contact for Eclicsys API.
      */
-    private function build_contact(array $address): array {
-        return array(
-            'fullname' => trim(($address['first_name'] ?? '') . ' ' . ($address['last_name'] ?? '')),
-            'email'    => $address['email'] ?? '',
-            'dni'      => '',
-            'phone'    => $address['phone'] ?? '',
-            'mobile'   => $address['phone'] ?? '',
-        );
+    private function build_contact(array $address, bool $include_phone = true): array {
+        $contact = array();
+
+        // Fullname is required
+        $fullname = trim(($address['first_name'] ?? '') . ' ' . ($address['last_name'] ?? ''));
+        if (!empty($fullname)) {
+            $contact['fullname'] = $fullname;
+        } else {
+            // Fallback if no name available
+            $contact['fullname'] = 'Customer';
+        }
+
+        // EMAIL IS REQUIRED - always include, with fallback
+        $email = $address['email'] ?? '';
+        if (!empty($email)) {
+            $contact['email'] = $email;
+        } else {
+            // Ultimate fallback to admin email (should never happen due to pre-processing)
+            $contact['email'] = get_option('admin_email');
+        }
+
+        // Only include phone/mobile/dni for main contact, not shipping sub-contact
+        if ($include_phone) {
+            $phone = $address['phone'] ?? '';
+            if (!empty($phone)) {
+                $contact['phone'] = $phone;
+            }
+
+            $mobile = $address['phone'] ?? ''; // Same as phone in WC
+            if (!empty($mobile)) {
+                $contact['mobile'] = $mobile;
+            }
+
+            // DNI is optional - only include if explicitly set
+            $dni = $address['dni'] ?? '';
+            if (!empty($dni)) {
+                $contact['dni'] = $dni;
+            }
+        }
+
+        return $contact;
     }
 
     /**
      * Build address array for Eclicsys API.
+     * Omits empty fields to prevent API validation errors.
      *
      * @param array  $address        WooCommerce address.
      * @param string $type           'shipping' or 'billing'.
@@ -121,23 +140,45 @@ class WC_Eclicsys_Order_Builder {
         $country = $address['country'] ?? 'AR';
         $state_code = $address['state'] ?? '';
 
-        // For shipping, locality is empty string
-        // For billing, locality can be the state or city
-        $locality = '';
-        if ($type === 'billing') {
-            $locality = $address['state'] ?? $address['city'] ?? '';
-        }
-
-        return array(
+        $result = array(
             'category_code' => $type,
             'iso_code'      => $country,
-            'street'        => $this->extract_street_name($address['address_1'] ?? ''),
-            'street_number' => $street_number,
-            'zip_code'      => $address['postcode'] ?? '',
-            'city'          => $address['city'] ?? '',
-            'locality'      => $locality,
-            'province'      => $this->get_state_name($country, $state_code),
         );
+
+        $street = $this->extract_street_name($address['address_1'] ?? '');
+        if (!empty($street)) {
+            $result['street'] = $street;
+        }
+
+        if (!empty($street_number)) {
+            $result['street_number'] = $street_number;
+        }
+
+        $zip_code = $address['postcode'] ?? '';
+        if (!empty($zip_code)) {
+            $result['zip_code'] = $zip_code;
+        }
+
+        $city = $address['city'] ?? '';
+        if (!empty($city)) {
+            $result['city'] = $city;
+        }
+
+        // For shipping, locality is empty - omit it entirely
+        // For billing, locality can be the state or city
+        if ($type === 'billing') {
+            $locality = $address['state'] ?? $address['city'] ?? '';
+            if (!empty($locality)) {
+                $result['locality'] = $locality;
+            }
+        }
+
+        $province = $this->get_state_name($country, $state_code);
+        if (!empty($province)) {
+            $result['province'] = $province;
+        }
+
+        return $result;
     }
 
     /**
@@ -152,7 +193,6 @@ class WC_Eclicsys_Order_Builder {
             return '';
         }
 
-        // Remove trailing numbers
         $name = preg_replace('/\s+\d+\s*.*$/', '', $address);
         return trim($name) ?: $address;
     }
@@ -169,7 +209,6 @@ class WC_Eclicsys_Order_Builder {
             return '';
         }
 
-        // Match last number in the string
         if (preg_match('/(\d+)\s*.*$/', $address, $matches)) {
             return $matches[1];
         }

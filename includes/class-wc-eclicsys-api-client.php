@@ -18,21 +18,66 @@ class WC_Eclicsys_API_Client {
     }
 
     /**
-     * Get cached auth token or request new one
+     * Log message using WooCommerce logger or error_log
+     */
+    private function log(string $message, array $context = []): void {
+        $settings = WC_Eclicsys_Settings::get_instance();
+
+        if (!$settings->is_debug()) {
+            return;
+        }
+
+        $log_message = '[Eclicsys API] ' . $message;
+        if (!empty($context)) {
+            $log_message .= ' | Context: ' . json_encode($context, JSON_UNESCAPED_UNICODE);
+        }
+
+        if (function_exists('wc_get_logger')) {
+            $logger = wc_get_logger();
+            $logger->debug($log_message, ['source' => 'eclicsys-api']);
+        } else {
+            error_log($log_message);
+        }
+    }
+
+    /**
+     * Generate a unique cache key based on credentials and URL.
+     * This ensures tokens are not shared between different environments.
+     */
+    private function get_token_cache_key(): string {
+        return 'eclicsys_api_token_' . md5($this->api_key . $this->api_secret . $this->api_url);
+    }
+
+    /**
+     * Get cached auth token or request new one.
+     * Tokens are cached per environment (key + secret + URL) to prevent
+     * cross-contamination between sandbox and production.
      */
     private function get_token(): string {
+        $cache_key = $this->get_token_cache_key();
+
         // Check instance cache first
         if ($this->token && $this->token_expires > (time() + 60)) {
+            $this->log('Reusing cached token', ['expires' => date('Y-m-d H:i:s', $this->token_expires)]);
             return $this->token;
         }
 
-        // Check WordPress transient cache
-        $cached = get_transient('eclicsys_api_token');
+        // Check WordPress transient cache - now keyed by environment
+        $cached = get_transient($cache_key);
         if ($cached && is_array($cached) && $cached['expires'] > time()) {
             $this->token = $cached['token'];
             $this->token_expires = $cached['expires'];
+            $this->log('Reusing token from transient', [
+                'cache_key' => $cache_key,
+                'expires' => date('Y-m-d H:i:s', $this->token_expires),
+            ]);
             return $this->token;
         }
+
+        $this->log('Requesting new auth token', [
+            'url' => $this->api_url . '/integrations/authenticate',
+            'cache_key' => $cache_key,
+        ]);
 
         $response = wp_remote_post($this->api_url . '/integrations/authenticate', [
             'headers' => ['Content-Type' => 'application/json'],
@@ -44,14 +89,18 @@ class WC_Eclicsys_API_Client {
         ]);
 
         if (is_wp_error($response)) {
+            $this->log('Auth failed', ['error' => $response->get_error_message()]);
             throw new Exception('Auth failed: ' . $response->get_error_message());
         }
 
         $body = json_decode(wp_remote_retrieve_body($response), true);
         $code = wp_remote_retrieve_response_code($response);
 
+        $this->log('Auth response', ['code' => $code, 'has_token' => !empty($body['token'])]);
+
         if ($code !== 200 || empty($body['token'])) {
             $error = $body['message'] ?? 'Unknown error';
+            $this->log('Auth error', ['code' => $code, 'error' => $error]);
             throw new Exception('Auth failed: ' . $error);
         }
 
@@ -59,11 +108,13 @@ class WC_Eclicsys_API_Client {
         $expires_in = (int) ($body['expires_in'] ?? 3600);
         $this->token_expires = time() + $expires_in;
 
-        // Cache in transient for 5 minutes less than expiry
-        set_transient('eclicsys_api_token', [
+        // Cache in transient with environment-specific key
+        set_transient($cache_key, [
             'token'   => $this->token,
             'expires' => $this->token_expires,
         ], max($expires_in - 300, 60));
+
+        $this->log('Token obtained', ['expires_in' => $expires_in, 'cache_key' => $cache_key]);
 
         return $this->token;
     }
@@ -87,64 +138,45 @@ class WC_Eclicsys_API_Client {
             if (!empty($data)) {
                 $url = add_query_arg($data, $url);
             }
+            $this->log('GET ' . $endpoint, ['url' => $url]);
             $response = wp_remote_get($url, $args);
         } else {
             $args['body'] = json_encode($data);
+            $this->log('POST ' . $endpoint, ['url' => $url, 'payload' => $data]);
             $response = wp_remote_post($url, $args);
         }
 
-        // Log request/response for debugging
-        $this->log_request($endpoint, $method, $data, $response);
-
         if (is_wp_error($response)) {
+            $this->log('Request failed', ['endpoint' => $endpoint, 'error' => $response->get_error_message()]);
             throw new Exception('Request failed: ' . $response->get_error_message());
         }
 
         $code = wp_remote_retrieve_response_code($response);
-        $body = json_decode(wp_remote_retrieve_body($response), true);
+        $body_raw = wp_remote_retrieve_body($response);
+        $body = json_decode($body_raw, true);
+
+        $this->log('Response ' . $endpoint, ['code' => $code, 'body' => $body ?? $body_raw]);
 
         if ($code >= 400) {
-            $error = $body['message'] ?? 'HTTP ' . $code;
-            throw new Exception('API error: HTTP ' . $code . ' - ' . $error . ' | Body: ' . json_encode($body));
+            $error = '';
+            if (is_array($body) && !empty($body['message'])) {
+                $error = $body['message'];
+            } elseif (is_array($body) && !empty($body['error'])) {
+                $error = $body['error'];
+            } else {
+                $error = strip_tags($body_raw);
+                $error = substr($error, 0, 500);
+            }
+            
+            $this->log('API error details', ['code' => $code, 'error' => $error, 'raw' => substr($body_raw, 0, 1000)]);
+            throw new Exception('API error: HTTP ' . $code . ' - ' . $error);
         }
 
         return $body ?? [];
     }
 
-    /**
-     * Log request and response details for debugging
-     */
-    private function log_request(string $endpoint, string $method, array $data, $response): void {
-        if (!defined('WP_DEBUG') || !WP_DEBUG) {
-            return;
-        }
-
-        $log_data = [
-            'timestamp' => date('Y-m-d H:i:s'),
-            'endpoint'  => $endpoint,
-            'method'    => $method,
-            'request'   => $data,
-        ];
-
-        if (is_wp_error($response)) {
-            $log_data['error'] = $response->get_error_message();
-        } else {
-            $log_data['response_code'] = wp_remote_retrieve_response_code($response);
-            $log_data['response_body'] = wp_remote_retrieve_body($response);
-        }
-
-        // Save to a dedicated log file
-        $log_file = WP_CONTENT_DIR . '/uploads/eclicsys-api-debug.log';
-        $log_entry = json_encode($log_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) . "\n---\n";
-
-        // Append to log file
-        file_put_contents($log_file, $log_entry, FILE_APPEND | LOCK_EX);
-
-        // Also log to WordPress debug log
-        error_log('[Eclicsys API] ' . $endpoint . ' ' . $method . ' | Code: ' . ($log_data['response_code'] ?? 'ERROR'));
-    }
-
     public function get_shipping_rates(string $zip_code, array $items): array {
+        $this->log('Getting shipping rates', ['zip_code' => $zip_code, 'items_count' => count($items)]);
         return $this->request('/integrations/tariffs', [
             'zip_code' => $zip_code,
             'items'    => $items,
@@ -152,59 +184,65 @@ class WC_Eclicsys_API_Client {
     }
 
     public function create_shipping_order(array $order_data): array {
+        $this->log('Creating shipping order', ['order_reference' => $order_data['order_reference'] ?? 'N/A']);
         return $this->request('/integrations/order', $order_data);
     }
 
+    /**
+     * Get shipping label PDF by tracking code
+     */
     public function get_label(string $tracking_code): string {
-        $response = wp_remote_get($this->api_url . '/integrations/order/tracking', [
+        $this->log('Getting label', ['tracking' => $tracking_code]);
+
+        $token = $this->get_token();
+        
+        $url = add_query_arg([
+            'tracking_code' => $tracking_code,
+        ], $this->api_url . '/integrations/order/tracking');
+
+        $this->log('Label request URL', ['url' => $url]);
+
+        $response = wp_remote_get($url, [
             'headers' => [
-                'Authorization' => 'Bearer ' . $this->get_token(),
+                'Authorization' => 'Bearer ' . $token,
                 'Accept'        => 'application/pdf',
             ],
-            'timeout' => 15,
+            'timeout' => 30,
         ]);
 
         if (is_wp_error($response)) {
+            $this->log('Label request failed', ['error' => $response->get_error_message()]);
             throw new Exception('Label request failed: ' . $response->get_error_message());
         }
 
-        if (wp_remote_retrieve_response_code($response) !== 200) {
-            throw new Exception('Label not available');
+        $code = wp_remote_retrieve_response_code($response);
+        $this->log('Label response', ['code' => $code]);
+
+        if ($code !== 200) {
+            $body = wp_remote_retrieve_body($response);
+            throw new Exception('Label not available (HTTP ' . $code . '): ' . $body);
         }
 
         return wp_remote_retrieve_body($response);
     }
 
     /**
-     * Extract tracking information from API response.
-     * The response structure is:
-     * {
-     *   "order": {
-     *     "id": 102,
-     *     "shipping": [{"tracking_code": "TRACK00102XQAJWH"}]
-     *   }
-     * }
+     * Extract tracking from API response
      */
     public static function extract_tracking(array $response): ?string {
         if (!empty($response['order']['shipping']) && is_array($response['order']['shipping'])) {
-            $first_shipment = $response['order']['shipping'][0];
-            if (!empty($first_shipment['tracking_code'])) {
-                return $first_shipment['tracking_code'];
+            $first = $response['order']['shipping'][0];
+            if (!empty($first['tracking_code'])) {
+                return $first['tracking_code'];
             }
         }
         return null;
     }
 
-    /**
-     * Extract order ID from API response.
-     */
     public static function extract_order_id(array $response): ?int {
         return $response['order']['id'] ?? null;
     }
 
-    /**
-     * Extract status from API response.
-     */
     public static function extract_status(array $response): string {
         return $response['order']['status_internal_process'] ?? 'processing';
     }

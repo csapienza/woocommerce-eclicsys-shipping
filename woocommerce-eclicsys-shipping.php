@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Eclicsys Shipping
  * Plugin URI:  https://eclicsys.com
  * Description: Real-time shipping rates and order integration with Eclicsys
- * Version:     2.0.0
+ * Version:     2.0.2
  * Author:      Eclicsys
  * Author URI:  https://eclicsys.com
  * License:     GPL-2.0+
@@ -13,7 +13,7 @@
 
 defined('ABSPATH') || exit;
 
-define('WC_ECLICSYS_VERSION', '2.0.0');
+define('WC_ECLICSYS_VERSION', '2.0.2');
 define('WC_ECLICSYS_FILE', __FILE__);
 define('WC_ECLICSYS_PATH', plugin_dir_path(__FILE__));
 define('WC_ECLICSYS_URL', plugin_dir_url(__FILE__));
@@ -26,6 +26,17 @@ add_action('before_woocommerce_init', function () {
             __FILE__,
             true
         );
+    }
+});
+
+// Clean up old token cache on upgrade
+add_action('plugins_loaded', function () {
+    $current_version = get_option('wc_eclicsys_version', '0.0.0');
+    
+    if (version_compare($current_version, '2.0.2', '<')) {
+        // Delete old global token transient that caused cross-environment contamination
+        delete_transient('eclicsys_api_token');
+        update_option('wc_eclicsys_version', WC_ECLICSYS_VERSION);
     }
 });
 
